@@ -29,6 +29,7 @@ def get_config(input_file: os.path = os.path.join(BASE_DIR, "input.json")):
         d = json.load(f)
     config = {**d.get("config", {}), **d.get("challenge", {})}
     return config
+    
 
 def iterative_sampling_loop(
     db_path: str,
@@ -65,6 +66,7 @@ def iterative_sampling_loop(
     mutation_prob = 0.1
     elite_frac = 0.25
 
+    
     while True:
         iteration += 1
         sampler_data = run_sampler(n_samples=n_samples_first_iteration if iteration == 1 else n_samples, 
