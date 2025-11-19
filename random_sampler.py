@@ -6,21 +6,15 @@ from typing import List, Tuple, Optional
 import bittensor as bt
 from rdkit import Chem
 from tqdm import tqdm
-import re
-from collections import defaultdict
-
-import sys
-
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
+from functools import lru_cache
 
 from miner_utils import validate_molecules_sampler
 from nova_ph2.combinatorial_db.reactions import (
     get_reaction_info, 
     get_smiles_from_reaction
 )
-from nova_ph2.utils import get_smiles, find_chemically_identical
 
+@lru_cache(maxsize=8)
 def get_available_reactions(db_path: str = None) -> List[Tuple[int, str, int, int, int]]:
     """
     Get all available reactions from the database.
@@ -48,6 +42,7 @@ def get_available_reactions(db_path: str = None) -> List[Tuple[int, str, int, in
         return []
 
 
+@lru_cache(maxsize=1024)
 def get_molecules_by_role(role_mask: int, db_path: str) -> List[Tuple[int, str, int]]:
     """
     Get all molecules that have the specified role_mask.
@@ -98,10 +93,11 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
         return {"molecules": [None] * n_samples}
 
     valid_molecules = []
+    valid_smiles = []
     seen_keys = set()
     iteration = 0
 
-    progress_bar = tqdm(total=n_samples, desc="Creating valid molecules", unit="molecule")
+    progress_bar = tqdm(total=n_samples, desc="Creating valid molecules", unit="molecule", miniters=100, mininterval=0.5)
     
     while len(valid_molecules) < n_samples:
         iteration += 1
@@ -144,70 +140,54 @@ def generate_valid_random_molecules_batch(rxn_id: int, n_samples: int, db_path: 
         batch_sampler_data = {"molecules": batch_molecules}
         batch_valid_molecules, batch_valid_smiles = validate_molecules_sampler(batch_sampler_data, subnet_config)
 
-        identical = find_chemically_identical(batch_valid_smiles)
-        skip_indices = set()
-        for indices in identical.values():
-            for j in indices[1:]:
-                skip_indices.add(j)
-
         added = 0
         for i, name in enumerate(batch_valid_molecules):
-            if i in skip_indices or not name:
+            if not name:
                 continue
             s = batch_valid_smiles[i] if i < len(batch_valid_smiles) else None
             if not s:
                 continue
             try:
-                mol = Chem.MolFromSmiles(s)
-                if not mol:
+                key = smiles_to_inchikey(s)
+                if not key:
                     continue
-                key = Chem.MolToInchiKey(mol)
             except Exception:
                 continue
-            if key in seen_keys:
+            if key in seen_keys or (avoid_inchikeys and key in avoid_inchikeys):
                 continue
 
             seen_keys.add(key)
             valid_molecules.append(name)
+            valid_smiles.append(s)
             added += 1
         
         progress_bar.update(added)
     
     final_molecules = valid_molecules[:n_samples]
+    final_smiles = valid_smiles[:n_samples]
     progress_bar.close()
 
-    return {"molecules": final_molecules}
+    return {"molecules": final_molecules,"smiles": final_smiles}
 
 
 def generate_molecules_from_pools(rxn_id: int, n: int, molecules_A: List[Tuple], molecules_B: List[Tuple], 
-                                molecules_C: List[Tuple], is_three_component: bool, seed: int = None) -> List[str]:
-    mol_ids = []
+                               molecules_C: List[Tuple], is_three_component: bool, seed: int = None) -> List[str]:
+    rng = random.Random(seed) if seed is not None else random
 
-    if seed is not None:
-        random.seed(seed)
-    
-    for i in range(n):
-        try:
-            mol_A = random.choice(molecules_A)
-            mol_B = random.choice(molecules_B)
-            
-            mol_id_A, smiles_A, role_mask_A = mol_A
-            mol_id_B, smiles_B, role_mask_B = mol_B
-            
-            if is_three_component:
-                mol_C = random.choice(molecules_C)
-                mol_id_C, smiles_C, role_mask_C = mol_C
-                product_name = f"rxn:{rxn_id}:{mol_id_A}:{mol_id_B}:{mol_id_C}"
-            else:
-                product_name = f"rxn:{rxn_id}:{mol_id_A}:{mol_id_B}"
-            
-            mol_ids.append(product_name)
-            
-        except Exception as e:
-            bt.logging.error(f"Error generating molecule {i+1}/{n}: {e}")
-            mol_ids.append(None)
-    
-    return mol_ids
+    A_ids = [a[0] for a in molecules_A]
+    B_ids = [b[0] for b in molecules_B]
+    C_ids = [c[0] for c in molecules_C] if is_three_component else None
+
+    picks_A = rng.choices(A_ids, k=n)
+    picks_B = rng.choices(B_ids, k=n)
+    if is_three_component:
+        picks_C = rng.choices(C_ids, k=n)
+        names = [f"rxn:{rxn_id}:{a}:{b}:{c}" for a, b, c in zip(picks_A, picks_B, picks_C)]
+    else:
+        names = [f"rxn:{rxn_id}:{a}:{b}" for a, b in zip(picks_A, picks_B)]
+
+    names = list(dict.fromkeys(names))
+    return names
 
 def _parse_components(name: str) -> tuple[int, int, int | None]:
     # name format: "rxn:{rxn_id}:{A}:{B}" or "rxn:{rxn_id}:{A}:{B}:{C}"
@@ -227,8 +207,7 @@ def generate_offspring_from_elites(rxn_id: int, n: int, elite_names: list[str],
                                    avoid_names: set[str] = None,
                                    avoid_inchikeys: set[str] = None,
                                    max_tries: int = 10) -> list[str]:
-    if seed is not None:
-        random.seed(seed)
+    rng = random.Random(seed) if seed is not None else random
     elite_As, elite_Bs, elite_Cs = set(), set(), set()
     for name in elite_names:
         A, B, C = _parse_components(name)
@@ -245,14 +224,14 @@ def generate_offspring_from_elites(rxn_id: int, n: int, elite_names: list[str],
     for _ in range(n):
         cand = None
         for _try in range(max_tries):
-            use_mutA = (not elite_As) or (random.random() < mutation_prob)
-            use_mutB = (not elite_Bs) or (random.random() < mutation_prob)
-            use_mutC = (not elite_Cs) or (random.random() < mutation_prob)
+            use_mutA = (not elite_As) or (rng.random() < mutation_prob)
+            use_mutB = (not elite_Bs) or (rng.random() < mutation_prob)
+            use_mutC = (not elite_Cs) or (rng.random() < mutation_prob)
 
-            A = random.choice(pool_A_ids) if use_mutA else random.choice(list(elite_As))
-            B = random.choice(pool_B_ids) if use_mutB else random.choice(list(elite_Bs))
+            A = rng.choice(pool_A_ids) if use_mutA else rng.choice(list(elite_As))
+            B = rng.choice(pool_B_ids) if use_mutB else rng.choice(list(elite_Bs))
             if is_three_component:
-                C = random.choice(pool_C_ids) if use_mutC else random.choice(list(elite_Cs))
+                C = rng.choice(pool_C_ids) if use_mutC else rng.choice(list(elite_Cs))
                 name = f"rxn:{rxn_id}:{A}:{B}:{C}"
             else:
                 name = f"rxn:{rxn_id}:{A}:{B}"
@@ -264,13 +243,11 @@ def generate_offspring_from_elites(rxn_id: int, n: int, elite_names: list[str],
 
             if avoid_inchikeys:
                 try:
-                    s = get_smiles_from_reaction(name)
+                    s = name_to_smiles_cached(name)
                     if s:
-                        mol = Chem.MolFromSmiles(s)
-                        if mol:
-                            key = Chem.MolToInchiKey(mol)
-                            if key in avoid_inchikeys:
-                                continue
+                        key = smiles_to_inchikey(s)
+                        if key and key in avoid_inchikeys:
+                            continue
                 except Exception:
                     pass
 
@@ -284,6 +261,23 @@ def generate_offspring_from_elites(rxn_id: int, n: int, elite_names: list[str],
         if avoid_names is not None:
             avoid_names.add(cand)
     return out
+
+@lru_cache(maxsize=200_000)
+def smiles_to_inchikey(s: str) -> Optional[str]:
+    try:
+        mol = Chem.MolFromSmiles(s)
+        if not mol:
+            return None
+        return Chem.MolToInchiKey(mol)
+    except Exception:
+        return None
+
+@lru_cache(maxsize=200_000)
+def name_to_smiles_cached(name: str) -> Optional[str]:
+    try:
+        return get_smiles_from_reaction(name)
+    except Exception:
+        return None
 
 def run_sampler(n_samples: int = 1000, 
                 seed: int = None, 
@@ -299,8 +293,6 @@ def run_sampler(n_samples: int = 1000,
     if not reactions:
         bt.logging.error("No reactions found in the database, check db path and integrity.")
         return
-
-    rxn_ids = [reactions[i][0] for i in range(len(reactions))]
 
     rxn_id = int(subnet_config["allowed_reaction"].split(":")[-1])
     bt.logging.info(f"Generating {n_samples} random molecules for reaction {rxn_id}")
